@@ -110,11 +110,16 @@ void freeBios(BIO *header, BIO *contentCache, BIO *targetHeader)
         BIO_free(targetHeader);
 }
 
-int writeBioToSsl(BIO *bio, SSL *ssl)
+int writeBioToSsl(BIO *bio, SSL *ssl, size_t *written)
 {
     BUF_MEM *buf;
+    size_t temp;
     BIO_get_mem_ptr(bio, &buf);
-    return SSL_write(ssl, buf->data, buf->length);
+    if (written == NULL)
+    {
+        written = &temp;
+    }
+    return SSL_write_ex(ssl, buf->data, buf->length, written);
 }
 
 #define BUF_SIZE 8192
@@ -276,11 +281,11 @@ void *handleRequest(void *sslreq)
         return NULL;
     }
 
-    ret = writeBioToSsl(targetHeader, subSsl);
+    ret = writeBioToSsl(targetHeader, subSsl, NULL);
     if (ret >= 0) // good connection
     {
         BIO_free(targetHeader);
-        ret = writeBioToSsl(contentCache, subSsl);
+        ret = writeBioToSsl(contentCache, subSsl, NULL);
         BIO_free(contentCache);
         transferData(ssl, subSsl);
     }
@@ -308,6 +313,11 @@ void transferData(SSL *victim, SSL *host)
     struct timeval timeout = {0, 1000};
     int victimSocket = SSL_get_fd(victim);
     int hostSocket = SSL_get_fd(host);
+    char *endStr = "\r\n\r\n";
+    int comparePos = 0;
+    bool hasReadHeader = false;
+    BIO *headerBio = BIO_new(BIO_s_mem());
+    BIO *contentCache = BIO_new(BIO_s_mem());
 
     while (1)
     {
@@ -370,11 +380,63 @@ void transferData(SSL *victim, SSL *host)
             ret = SSL_read_ex(host, buffer, BUF_SIZE, &readBytes);
             if (ret > 0) // success
             {
-                ret = SSL_write_ex(victim, buffer, readBytes, &writtenBytes);
-                if (!ret || readBytes != writtenBytes) // error sending to victim
+                if (!hasReadHeader)
                 {
-                    LOGERROR(transferData, "Failed to transmit to victim!");
-                    break;
+                    for (int i = 0; i < readBytes; i++)
+                    {
+                        if (buffer[i] != endStr[comparePos])
+                        {
+                            if (comparePos != 0)
+                                comparePos = 0; // reset
+                            continue;
+                        }
+                        for (; buffer[i] == endStr[comparePos] && i < readBytes && comparePos < 4;
+                             i++, comparePos++)
+                            ;
+                        if (comparePos == 4) // we have found the end
+                        {
+                            hasReadHeader = true;
+                            BIO_write(headerBio, buffer, i); // i is past-end here, in other words, len
+                            BIO_write(contentCache, buffer + i, readBytes - i);
+                            break;
+                        }
+                        else
+                        {
+                            // revert i
+                            --i;
+                        }
+                    }
+                    if (hasReadHeader)
+                    {
+                        BIO *targetHeader = BIO_new(BIO_s_mem());
+                        int lineLen;
+                        char line[BUF_SIZE];
+                        while (lineLen = BIO_gets(headerBio, line, BUF_SIZE))
+                        {
+                            if (memcmp(line, "\r\n\r\n", 4) == 0)
+                            {
+                                BIO_write(targetHeader, "\r\n\r\n", 4);
+                            }
+                            int start = 0;
+                            for (; line[start] != ' '; start++) // skip tag
+                                ;
+                            for (; line[start] == ' '; start++) // skip spaces
+                                ;
+                            modifiyVictimHeader(targetHeader, line, line + start, lineLen);
+                        }
+                        writeBioToSsl(targetHeader, victim, &writtenBytes);
+                        writeBioToSsl(contentCache, victim, &writtenBytes);
+                        freeBios(headerBio, contentCache, targetHeader);
+                    }
+                }
+                else
+                {
+                    ret = SSL_write_ex(victim, buffer, readBytes, &writtenBytes);
+                    if (!ret || readBytes != writtenBytes) // error sending to victim
+                    {
+                        LOGERROR(transferData, "Failed to transmit to victim!");
+                        break;
+                    }
                 }
             }
             else
