@@ -46,7 +46,8 @@ int create_socket(uint16_t port)
 
 void *handleRequest(void *sslreq);
 void transferData(SSL *victim, SSL *host);
-void modifiyVictimHeader(BIO *target, const char *tagStart, const char *valueStart, int len);
+void modifyRequestHeader(BIO *target, const char *tagStart, const char *valueStart, int len);
+void modifyResponseHeader(BIO *target, const char *tagStart, const char *valueStart, int len);
 void exploitVictimData(char *buffer, int len);
 void exploitHostData(char *buffer, int len);
 
@@ -230,7 +231,7 @@ void *handleRequest(void *sslreq)
         }
         else
         {
-            modifiyVictimHeader(targetHeader, line, line + start, lineLen);
+            modifyRequestHeader(targetHeader, line, line + start, lineLen);
         }
     }
     BIO_free(headerBio);
@@ -300,7 +301,11 @@ void *handleRequest(void *sslreq)
     close(client);
 }
 
-void modifiyVictimHeader(BIO *target, const char *tagStart, const char *valueStart, int len)
+void modifyRequestHeader(BIO *target, const char *tagStart, const char *valueStart, int len)
+{
+    int written = BIO_write(target, tagStart, len);
+}
+void modifyResponseHeader(BIO *target, const char *tagStart, const char *valueStart, int len)
 {
     int written = BIO_write(target, tagStart, len);
 }
@@ -422,7 +427,7 @@ void transferData(SSL *victim, SSL *host)
                                 ;
                             for (; line[start] == ' '; start++) // skip spaces
                                 ;
-                            modifiyVictimHeader(targetHeader, line, line + start, lineLen);
+                            modifyResponseHeader(targetHeader, line, line + start, lineLen);
                         }
                         writeBioToSsl(targetHeader, victim, &writtenBytes);
                         writeBioToSsl(contentCache, victim, &writtenBytes);
