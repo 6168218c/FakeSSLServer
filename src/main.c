@@ -46,6 +46,7 @@ int create_socket(uint16_t port)
 
 void *handleRequest(void *sslreq);
 void transferData(SSL *victim, SSL *host);
+void modifiyVictimHeader(BIO *target, const char *tagStart, const char *valueStart, int len);
 void exploitVictimData(char *buffer, int len);
 void exploitHostData(char *buffer, int len);
 
@@ -99,6 +100,23 @@ void errCloseSSL(SSL *ssl, int err)
         close(fd);
 }
 
+void freeBios(BIO *header, BIO *contentCache, BIO *targetHeader)
+{
+    if (header)
+        BIO_free(header);
+    if (contentCache)
+        BIO_free(contentCache);
+    if (targetHeader)
+        BIO_free(targetHeader);
+}
+
+int writeBioToSsl(BIO *bio, SSL *ssl)
+{
+    BUF_MEM *buf;
+    BIO_get_mem_ptr(bio, &buf);
+    return SSL_write(ssl, buf->data, buf->length);
+}
+
 #define BUF_SIZE 8192
 
 void *handleRequest(void *sslreq)
@@ -120,60 +138,107 @@ void *handleRequest(void *sslreq)
         errCloseSSL(ssl, err);
         return NULL;
     }
-    int serverSocket = 0;
+
     size_t readBytes = 0;
-    char *host = NULL;
-    int content_length = 0;
-    if (ret = SSL_read_ex(ssl, buffer, BUF_SIZE, &readBytes) >= 0)
+    BIO *headerBio = BIO_new(BIO_s_mem());
+    BIO *contentCache = BIO_new(BIO_s_mem());
+    char *endStr = "\r\n\r\n";
+    int comparePos = 0;
+    bool hasReadHeader = false;
+    while (!hasReadHeader && (ret = SSL_read_ex(ssl, buffer, BUF_SIZE, &readBytes) >= 0))
     {
         if (readBytes > 0) // we should have read header
         {
-            char *lineBegin = buffer;
-            for (char *pos = buffer; pos < buffer + BUF_SIZE - 3; pos++)
+            for (int i = 0; i < readBytes; i++)
             {
-                if (*pos == '\r' && *(pos + 1) == '\n') // lineEnd
+                if (buffer[i] != endStr[comparePos])
                 {
-                    char *nextStart = pos + 2;
-                    if (lineBegin)
-                    {
-                        if (strncmp(lineBegin, "Host", 4) == 0) // HOST
-                        {
-                            host = malloc(pos - lineBegin);
-                            memset(host, 0, pos - lineBegin);
-                            char *start = lineBegin + 5;
-                            if (*start == ' ')
-                                start++;
-                            memcpy(host, start, pos - start);
-                            // we found what we want, break
-                            break;
-                        }
-                    }
-                    if (*nextStart == '\r' && *(nextStart + 1) == '\n') // header end
-                        break;
-                    lineBegin = pos + 2;
+                    if (comparePos != 0)
+                        comparePos = 0; // reset
+                    continue;
+                }
+                for (; buffer[i] == endStr[comparePos] && i < readBytes && comparePos < 4;
+                     i++, comparePos++)
+                    ;
+                if (comparePos == 4) // we have found the end
+                {
+                    hasReadHeader = true;
+                    BIO_write(headerBio, buffer, i); // i is past-end here, in other words, len
+                    BIO_write(contentCache, buffer + i, readBytes - i);
+                    break;
+                }
+                else
+                {
+                    // revert i
+                    --i;
                 }
             }
         }
+        else
+        {
+            err = SSL_get_error(ssl, ret);
+            if (err != SSL_ERROR_NONE && err != SSL_ERROR_ZERO_RETURN)
+            {
+                errCloseSSL(ssl, err);
+                return NULL;
+            }
+        }
     }
-    else
+
+    BIO *targetHeader = BIO_new(BIO_s_mem());
+    char line[BUF_SIZE];
+    int lineLen;
+
+    struct hostent *remoteHost;
+    bool foundHost = false;
+    while (lineLen = BIO_gets(headerBio, line, BUF_SIZE))
     {
-        errCloseSSL(ssl, SSL_ERROR_NONE);
-        return NULL;
+        if (memcmp(line, "\r\n\r\n", 4) == 0)
+        {
+            BIO_write(targetHeader, "\r\n\r\n", 4);
+        }
+        int start = 0;
+        for (; line[start] != ' '; start++) // skip tag
+            ;
+        for (; line[start] == ' '; start++) // skip spaces
+            ;
+        if (memcmp(line, "Host", 4) == 0)
+        {
+            foundHost = true;
+            int end = lineLen - 2;
+            char *host = malloc(end + 1 - start);
+            memset(host, 0, end + 1 - start);
+            memcpy(host, line + start, end - start);
+            remoteHost = gethostbyname(host);
+            free(host);
+            if (remoteHost == NULL) // or satisify some condition
+            {
+#if DEBUG
+                remoteHost = gethostbyname("www.baidu.com");
+                BIO_puts(targetHeader, "Host: www.baidu.com\r\n");
+#endif
+            }
+            else
+            {
+                BIO_write(targetHeader, line, lineLen);
+            }
+        }
+        else
+        {
+            modifiyVictimHeader(targetHeader, line, line + start, lineLen);
+        }
     }
+    BIO_free(headerBio);
+    if (!foundHost)
+    {
+        freeBios(NULL, contentCache, targetHeader);
+    }
+
+    int serverSocket = 0;
     struct sockaddr_in addr;
     addr.sin_family = AF_INET;
     addr.sin_port = htons(443);
     addr.sin_addr.s_addr;
-#ifdef DEBUG
-    host = "localhost";
-#else
-    if (host == NULL) // could not resolve host
-    {
-        errCloseSSL(ssl, SSL_ERROR_NONE);
-        return NULL;
-    }
-#endif
-    struct hostent *remoteHost = gethostbyname(host);
     if (remoteHost == NULL || remoteHost->h_addrtype != AF_INET || remoteHost->h_addr_list[0] == 0)
     {
         LOGERROR(gethostbyname, "Unable to resolve remote host");
@@ -186,6 +251,7 @@ void *handleRequest(void *sslreq)
     {
         perror("Unable to create socket");
         errCloseSSL(ssl, SSL_ERROR_NONE);
+        freeBios(NULL, contentCache, targetHeader);
         return NULL;
     }
     if (connect(serverSocket, (struct sockaddr *)&addr, sizeof(addr)) < 0)
@@ -194,6 +260,7 @@ void *handleRequest(void *sslreq)
         close(serverSocket);
         SSL_write(ssl, "Failed to connect to host!", 26);
         errCloseSSL(ssl, SSL_ERROR_NONE);
+        freeBios(NULL, contentCache, targetHeader);
         return NULL;
     }
     SSL_CTX *subContext = SSL_CTX_new(TLS_client_method());
@@ -205,11 +272,16 @@ void *handleRequest(void *sslreq)
         err = SSL_get_error(subSsl, ret);
         errCloseSSL(subSsl, err);
         errCloseSSL(ssl, SSL_ERROR_NONE);
+        freeBios(NULL, contentCache, targetHeader);
         return NULL;
     }
-    ret = SSL_write(subSsl, buffer, readBytes);
+
+    ret = writeBioToSsl(targetHeader, subSsl);
     if (ret >= 0) // good connection
     {
+        BIO_free(targetHeader);
+        ret = writeBioToSsl(contentCache, subSsl);
+        BIO_free(contentCache);
         transferData(ssl, subSsl);
     }
 
@@ -221,6 +293,11 @@ void *handleRequest(void *sslreq)
     SSL_shutdown(ssl);
     SSL_free(ssl);
     close(client);
+}
+
+void modifiyVictimHeader(BIO *target, const char *tagStart, const char *valueStart, int len)
+{
+    int written = BIO_write(target, tagStart, len);
 }
 
 void transferData(SSL *victim, SSL *host)
