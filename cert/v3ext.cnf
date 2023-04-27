@@ -1,0 +1,13 @@
+basicConstraints=CA:FALSE
+keyUsage=digitalSignature, nonRepudiation, keyEncipherment, dataEncipherment
+extendedKeyUsage=serverAuth
+subjectAltName=@alt_names
+
+[alt_names]
+DNS.1=*.baidu.com
+DNS.2=*.bing.com
+DNS.3=*.bilibili.com
+DNS.4=*.qq.com
+DNS.5=*.dingtalk.com
+DNS.6=*.zju.edu.cn
+DNS.7=localhost
