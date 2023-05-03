@@ -2,6 +2,8 @@
 
 #define MIN(x, y) ((x < y) ? x : y)
 
+SSL_CTX *clientCtx;
+
 int ssl_alpn_configurer(SSL *ssl,
                         const unsigned char **out,
                         unsigned char *outlen,
@@ -58,4 +60,14 @@ void ssl_configure_context(SSL_CTX *ctx)
         ERR_print_errors_fp(stderr);
         exit(EXIT_FAILURE);
     }
+}
+
+void create_global_contexts()
+{
+    clientCtx = SSL_CTX_new(TLS_client_method());
+}
+
+void free_global_contexts()
+{
+    SSL_CTX_free(clientCtx);
 }

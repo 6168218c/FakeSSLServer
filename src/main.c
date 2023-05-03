@@ -13,12 +13,9 @@
 #include <pthread.h>
 #include <time.h>
 
+#include "shared.h"
 #include "sslutil.h"
-
-#define FAILFAST(function, msg)                       \
-    perror("Error occurred in [" #function "]:" msg); \
-    exit(EXIT_FAILURE);
-#define LOGERROR(category, msg) perror("Error occurred in [" #category "] " msg);
+#include "httputil.h"
 
 int create_socket(uint16_t port)
 {
@@ -46,6 +43,7 @@ int create_socket(uint16_t port)
     return skt;
 }
 
+void *proxyHandler(void *arg);
 void *handleRequest(void *sslreq);
 void transferData(SSL *victim, SSL *host, FILE *logReq, FILE *logRes);
 void modifyRequestHeader(BIO *target, const char *tagStart, const char *valueStart, int len);
@@ -82,6 +80,7 @@ int main(int argc, char **argv)
     SSL_load_error_strings();
     SSL_CTX *ctx = ssl_create_context();
     ssl_configure_context(ctx);
+    create_global_contexts();
 
     int sock = create_socket(port);
     // signal(SIGPIPE, SIG_IGN);
@@ -100,10 +99,13 @@ int main(int argc, char **argv)
         ssl = SSL_new(ctx);
         SSL_set_fd(ssl, client);
         pthread_t thread;
-        pthread_create(&thread, NULL, handleRequest, ssl);
+        pthread_create(&thread, NULL, proxyHandler, ssl);
         pthread_detach(thread);
+        // proxyHandler(ssl);
+        //  handleRequest(ssl);
     }
 
+    free_global_contexts();
     SSL_CTX_free(ctx);
 }
 
@@ -146,7 +148,7 @@ int logData(char *buf, int len, FILE *file)
     fwrite(buf, 1, len, file);
 }
 
-int writeBioToSsl(BIO *bio, SSL *ssl, size_t *written)
+static int writeBioToSsl(BIO *bio, SSL *ssl, size_t *written)
 {
     BUF_MEM *buf;
     size_t temp;
@@ -158,14 +160,58 @@ int writeBioToSsl(BIO *bio, SSL *ssl, size_t *written)
     return SSL_write_ex(ssl, buf->data, buf->length, written);
 }
 
-#define BUF_SIZE 8192
-typedef struct
+void *proxyHandler(void *arg)
 {
-    /* data */
-    SSL *victim;
-    SSL *host;
-    char *origin;
-} ProxySession;
+    int connid;
+    pthread_mutex_lock(&connectionMutex);
+    connid = ++connectionId;
+    pthread_mutex_unlock(&connectionMutex);
+
+    SSL *ssl = arg;
+    ProxySession *session = ProxySession_New(ssl, logFolder, connid, modifyRequestHeader, modifyResponseHeader);
+    if (!ProxySession_ConnectToVictim(session))
+    {
+        LOGERROR(proxyHandler, "Failed to connect to victim");
+        ProxySession_Free(session);
+        return NULL;
+    }
+    char *origin = ProxySession_RetrieveOrigin(session);
+    if (!origin)
+    {
+        LOGERROR(proxyHandler, "Failed to retrieve origin");
+        ProxySession_Free(session);
+        return NULL;
+    }
+    if (!ProxySession_ConnectToOrigin(session))
+    {
+        LOGERROR(proxyHandler, "Failed to connect to origin");
+        ProxySession_Free(session);
+        return NULL;
+    }
+    while (!session->shouldShutdown)
+    {
+        int ret = ProxySession_WaitToRead(session);
+        ProxyResult proxy;
+        if ((proxy = ProxySession_HandleVictimTransmit(session)) <= 0)
+        {
+            if (proxy == PROXY_FATAL)
+            {
+                LOGERROR(proxyHandler, "Failed to transmit to victim");
+                ProxySession_Free(session);
+                return NULL;
+            }
+        }
+        if (!ProxySession_HandleHostTransmit(session))
+        {
+            LOGERROR(proxyHandler, "Failed to transmit to host");
+            ProxySession_Free(session);
+            return NULL;
+        }
+    }
+
+    ProxySession_Free(session);
+    return NULL;
+}
 
 void *handleRequest(void *sslreq)
 {
@@ -271,9 +317,9 @@ void *handleRequest(void *sslreq)
     bool foundHost = false;
     while (lineLen = BIO_gets(headerBio, line, BUF_SIZE))
     {
-        if (memcmp(line, "\r\n\r\n", 4) == 0)
+        if (memcmp(line, "\r\n", 2) == 0)
         {
-            BIO_write(targetHeader, "\r\n\r\n", 4);
+            BIO_write(targetHeader, "\r\n", 2);
         }
         int start = 0;
         for (; line[start] != ' '; start++) // skip tag
