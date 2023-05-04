@@ -166,6 +166,18 @@ char *ProxySession_RetrieveOrigin(ProxySession *session)
     }
 
     int lineLen;
+    if (SSL_get_servername_type(state->sslConnection) == TLSEXT_NAMETYPE_host_name)
+    {
+        // use SNI
+        char *servername = SSL_get_servername(state->sslConnection, TLSEXT_NAMETYPE_host_name);
+        if (servername)
+        {
+            int nameLen = strlen(servername);
+            session->origin = malloc(nameLen + 1);
+            memset(session->origin, 0, nameLen + 1);
+            strcpy(session->origin, servername);
+        }
+    }
     BIO *headerBio = state->header;
     BIO *targetHeader = BIO_new(BIO_s_mem());
     while (lineLen = BIO_gets(headerBio, session->buffer, BUF_SIZE))
@@ -180,7 +192,7 @@ char *ProxySession_RetrieveOrigin(ProxySession *session)
             ;
         for (; session->buffer[start] == ' '; start++) // skip spaces
             ;
-        if (memcmp(session->buffer, "Host", 4) == 0)
+        if (!session->origin && ((session->buffer, "Host", 4) == 0))
         {
             int end = lineLen - 2;
             session->origin = malloc(end + 1 - start);
