@@ -4,7 +4,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <netinet/tcp.h>
-static int BIO_write_to_ssl(BIO *bio, SSL *ssl, size_t *written)
+static int BIO_write_to_ssl(BIO *bio, SSLConnection *sslConnection, size_t *written)
 {
     char *buf;
     size_t temp;
@@ -13,7 +13,7 @@ static int BIO_write_to_ssl(BIO *bio, SSL *ssl, size_t *written)
     {
         written = &temp;
     }
-    return SSL_write_ex(ssl, buf, len, written);
+    return SSLConnection_Write(sslConnection, buf, len, written);
 }
 static void BIO_dispose_used(BIO *bio, char *buffer, int buflen)
 {
@@ -42,9 +42,8 @@ static void HttpState_Free(HttpState *state)
     }
     if (state->sslConnection)
     {
-        if (state->errCode != SSL_ERROR_SSL && state->errCode != SSL_ERROR_SYSCALL)
-            SSL_shutdown(state->sslConnection);
-        SSL_free(state->sslConnection);
+        SSLConnection_Shutdown(state->sslConnection);
+        SSLConnection_Free(state->sslConnection);
         state->sslConnection = NULL;
     }
     if (state->loggingFile)
@@ -69,7 +68,7 @@ ProxySession *ProxySession_New(SSL *ssl, char *loggingPath, int id, HeaderModifi
 
     session->victimState = malloc(sizeof(HttpState));
     memset(session->victimState, 0, sizeof(HttpState));
-    session->victimState->sslConnection = ssl;
+    session->victimState->sslConnection = SSLConnection_New(ssl);
     session->victimState->header = BIO_new(BIO_s_mem());
     session->victimState->contentCache = BIO_new(BIO_s_mem());
 
@@ -89,10 +88,9 @@ ProxySession *ProxySession_New(SSL *ssl, char *loggingPath, int id, HeaderModifi
 int ProxySession_ConnectToVictim(ProxySession *session)
 {
     int ret;
-    if (ret = SSL_accept(session->victimState->sslConnection) <= 0)
+    if (ret = SSLConnection_Accept(session->victimState->sslConnection) <= 0)
     {
         ERR_print_errors_fp(stderr);
-        session->victimState->errCode = SSL_get_error(session->victimState->sslConnection, ret);
         return 0;
     }
     return 1;
@@ -103,22 +101,13 @@ char *ProxySession_RetrieveOrigin(ProxySession *session)
     size_t readBytes;
     HttpState *state = session->victimState;
     char *buffer = session->buffer;
-    SSL *ssl = state->sslConnection;
     state->streamState = HTTP_STREAM_HEADER;
-    if (!SSL_is_init_finished(ssl))
-    {
-        if (ret = SSL_do_handshake(ssl) <= 0)
-        {
-            state->errCode = SSL_get_error(ssl, ret);
-        }
-    }
-    while (state->streamState == HTTP_STREAM_HEADER && (ret = SSL_read_ex(ssl, buffer, BUF_SIZE, &readBytes) >= 0))
+    while (state->streamState == HTTP_STREAM_HEADER && (ret = SSLConnection_Read(state->sslConnection, buffer, BUF_SIZE, &readBytes) >= 0))
     {
         if (ret == 0)
         {
-            ret = SSL_do_handshake(ssl);
-            state->errCode = SSL_get_error(ssl, ret);
-            continue;
+            if (SSLConnection_GetLastError(state->sslConnection) == SSL_ERROR_WANT_READ || SSLConnection_GetLastError(state->sslConnection) == SSL_ERROR_WANT_WRITE)
+                continue;
         }
         if (readBytes > 0) // we should have read header
         {
@@ -157,8 +146,8 @@ char *ProxySession_RetrieveOrigin(ProxySession *session)
         }
         else
         {
-            state->errCode = SSL_get_error(ssl, ret);
-            if (state->errCode != SSL_ERROR_NONE && state->errCode != SSL_ERROR_ZERO_RETURN)
+            int err = SSLConnection_GetLastError(state->sslConnection);
+            if (err != SSL_ERROR_NONE && err != SSL_ERROR_ZERO_RETURN)
             {
                 return NULL;
             }
@@ -166,10 +155,10 @@ char *ProxySession_RetrieveOrigin(ProxySession *session)
     }
 
     int lineLen;
-    if (SSL_get_servername_type(state->sslConnection) == TLSEXT_NAMETYPE_host_name)
+    if (SSL_get_servername_type(state->sslConnection->rawSsl) == TLSEXT_NAMETYPE_host_name)
     {
         // use SNI
-        char *servername = SSL_get_servername(state->sslConnection, TLSEXT_NAMETYPE_host_name);
+        const char *servername = SSL_get_servername(state->sslConnection->rawSsl, TLSEXT_NAMETYPE_host_name);
         if (servername)
         {
             int nameLen = strlen(servername);
@@ -177,6 +166,14 @@ char *ProxySession_RetrieveOrigin(ProxySession *session)
             memset(session->origin, 0, nameLen + 1);
             strcpy(session->origin, servername);
         }
+#ifdef DEBUG_REDIRECT
+        else
+        {
+            session->origin = malloc(15);
+            memset(session->origin, 0, 15);
+            strcpy(session->origin, "www.baidu.com");
+        }
+#endif
     }
     BIO *headerBio = state->header;
     BIO *targetHeader = BIO_new(BIO_s_mem());
@@ -192,13 +189,13 @@ char *ProxySession_RetrieveOrigin(ProxySession *session)
             ;
         for (; session->buffer[start] == ' '; start++) // skip spaces
             ;
-        if (!session->origin && ((session->buffer, "Host", 4) == 0))
+        if (!session->origin && (memcmp(session->buffer, "Host", 4) == 0))
         {
             int end = lineLen - 2;
             session->origin = malloc(end + 1 - start);
             memset(session->origin, 0, end + 1 - start);
             memcpy(session->origin, session->buffer + start, end - start);
-#ifdef DEBUG
+#ifdef DEBUG_REDIRECT
             struct hostent *remoteHost = gethostbyname(session->origin);
             if (remoteHost == NULL)
             {
@@ -263,13 +260,12 @@ int ProxySession_ConnectToOrigin(ProxySession *session)
         return false;
     }
     HttpState *state = session->hostState;
-    state->sslConnection = SSL_new(clientCtx);
-    SSL_set_fd(state->sslConnection, serverSocket);
-    int ret;
-    if (ret = SSL_connect(state->sslConnection) <= 0)
+    SSL *serverSSL = SSL_new(clientCtx);
+    SSL_set_fd(serverSSL, serverSocket);
+    state->sslConnection = SSLConnection_New(serverSSL);
+    if (SSLConnection_Connect(state->sslConnection) <= 0)
     {
         ERR_print_errors_fp(stderr);
-        state->errCode = SSL_get_error(state->sslConnection, ret);
         return false;
     }
     state->header = BIO_new(BIO_s_mem());
@@ -291,7 +287,6 @@ int ProxySession_FlushHeaderCache(ProxySession *session, HttpState *source, Http
         if (ret = BIO_write_to_ssl(source->header, dest->sslConnection, &writtenBytes) <= 0)
         {
             ERR_print_errors_fp(stderr);
-            dest->errCode = SSL_get_error(dest->sslConnection, ret);
             return false;
         }
         BIO_reset(source->header);
@@ -303,7 +298,6 @@ int ProxySession_FlushHeaderCache(ProxySession *session, HttpState *source, Http
         if (ret = BIO_write_to_ssl(source->header, dest->sslConnection, &writtenBytes) <= 0)
         {
             ERR_print_errors_fp(stderr);
-            dest->errCode = SSL_get_error(dest->sslConnection, ret);
             return false;
         }
         BIO_reset(source->header);
@@ -325,7 +319,6 @@ int ProxySession_FlushContentCache(ProxySession *session, HttpState *source, Htt
                 BIO *currContent = BIO_new_mem_buf(buf, total - bioStart);
                 int lineLen;
                 int nextChunkLen = -1;
-                int ret;
                 while (lineLen = BIO_gets(currContent, session->buffer, BUF_SIZE) > 0)
                 {
                     if (memcmp(session->buffer, "\r\n", 2) != 0) // not an empty line
@@ -350,10 +343,9 @@ int ProxySession_FlushContentCache(ProxySession *session, HttpState *source, Htt
                         // flush all content
                         // reset to start first
                         BIO_free(currContent);
-                        if (ret = BIO_write_to_ssl(source->contentCache, dest->sslConnection, NULL) <= 0)
+                        if (BIO_write_to_ssl(source->contentCache, dest->sslConnection, NULL) <= 0)
                         {
                             ERR_print_errors_fp(stderr);
-                            dest->errCode = SSL_get_error(dest->sslConnection, ret);
                             return false;
                         }
                         BIO_reset(source->contentCache);
@@ -375,10 +367,9 @@ int ProxySession_FlushContentCache(ProxySession *session, HttpState *source, Htt
                     BIO_free(currContent);
                     BIO_read(source->contentCache, session->buffer, curLen);
                     size_t writtenBytes;
-                    if (ret = SSL_write_ex(dest->sslConnection, session->buffer, curLen, &writtenBytes) <= 0)
+                    if (SSLConnection_Write(dest->sslConnection, session->buffer, curLen, &writtenBytes) <= 0)
                     {
                         ERR_print_errors_fp(stderr);
-                        dest->errCode = SSL_get_error(dest->sslConnection, ret);
                         return false;
                     }
                     // in the above steps we send the prepending data
@@ -395,10 +386,9 @@ int ProxySession_FlushContentCache(ProxySession *session, HttpState *source, Htt
                 if (source->bytesLeft < available)
                 {
                     BIO_read(source->contentCache, session->buffer, source->bytesLeft);
-                    if (ret = SSL_write_ex(dest->sslConnection, session->buffer, source->bytesLeft, &writtenBytes) <= 0)
+                    if (ret = SSLConnection_Write(dest->sslConnection, session->buffer, source->bytesLeft, &writtenBytes) <= 0)
                     {
                         ERR_print_errors_fp(stderr);
-                        dest->errCode = SSL_get_error(dest->sslConnection, ret);
                         return false;
                     }
                     source->bytesLeft = 0;
@@ -407,10 +397,9 @@ int ProxySession_FlushContentCache(ProxySession *session, HttpState *source, Htt
                 }
                 else
                 {
-                    if (ret = SSL_write_ex(dest->sslConnection, buf, available, &writtenBytes) <= 0)
+                    if (ret = SSLConnection_Write(dest->sslConnection, buf, available, &writtenBytes) <= 0)
                     {
                         ERR_print_errors_fp(stderr);
-                        dest->errCode = SSL_get_error(dest->sslConnection, ret);
                         return false;
                     }
                     BIO_reset(source->contentCache);
@@ -430,7 +419,6 @@ int ProxySession_FlushContentCache(ProxySession *session, HttpState *source, Htt
         if (ret = BIO_write_to_ssl(source->contentCache, dest->sslConnection, &writtenBytes) <= 0)
         {
             ERR_print_errors_fp(stderr);
-            dest->errCode = SSL_get_error(dest->sslConnection, ret);
             return false;
         }
         BIO_reset(source->contentCache);
@@ -448,7 +436,6 @@ int ProxySession_FlushContentCache(ProxySession *session, HttpState *source, Htt
         if (ret = BIO_write_to_ssl(source->contentCache, dest->sslConnection, NULL) <= 0)
         {
             ERR_print_errors_fp(stderr);
-            dest->errCode = SSL_get_error(dest->sslConnection, ret);
             return false;
         }
         BIO_reset(source->contentCache);
@@ -463,8 +450,8 @@ int ProxySession_WaitToRead(ProxySession *session)
     }
     struct timeval timeout = {0, 1000000};
     FD_ZERO(&session->fdread);
-    int victimSocket = SSL_get_fd(session->victimState->sslConnection);
-    int hostSocket = SSL_get_fd(session->hostState->sslConnection);
+    int victimSocket = session->victimState->sslConnection->rawSocket;
+    int hostSocket = session->hostState->sslConnection->rawSocket;
     FD_SET(victimSocket, &session->fdread);
     FD_SET(hostSocket, &session->fdread);
     int max = victimSocket > hostSocket ? victimSocket + 1 : hostSocket + 1;
@@ -572,14 +559,14 @@ void ProxySession_ModifyHeader(ProxySession *session, HttpState *state, HeaderMo
 }
 ProxyResult ProxySession_HandleTransmit(ProxySession *session, HttpState *source, HttpState *dest, HeaderModifier sourceMod, FILE *logFile)
 {
-    int socket = SSL_get_fd(source->sslConnection);
+    int socket = source->sslConnection->rawSocket;
     if (!FD_ISSET(socket, &session->fdread))
     {
         return PROXY_OK;
     }
     int ret;
     size_t readBytes;
-    if (ret = SSL_read_ex(source->sslConnection, session->buffer, BUF_SIZE, &readBytes) > 0)
+    if (ret = SSLConnection_Read(source->sslConnection, session->buffer, BUF_SIZE, &readBytes) > 0)
     {
         if (readBytes == 0)
         {
@@ -630,8 +617,8 @@ ProxyResult ProxySession_HandleTransmit(ProxySession *session, HttpState *source
     else
     {
         ERR_print_errors_fp(stderr);
-        source->errCode = SSL_get_error(source->sslConnection, ret);
-        if (source->errCode == SSL_ERROR_NONE || source->errCode == SSL_ERROR_ZERO_RETURN)
+        int err = SSLConnection_GetLastError(source->sslConnection);
+        if (err == SSL_ERROR_NONE || err == SSL_ERROR_ZERO_RETURN)
         {
             session->shouldShutdown = true;
             return PROXY_FAIL;

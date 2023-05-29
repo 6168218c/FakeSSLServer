@@ -7,7 +7,7 @@
                 "/usr/include/**"
             ],
             "defines": [
-                "DEBUG"
+                "_DEBUG"
             ],
             "compilerPath": "/usr/bin/gcc",
             "cStandard": "gnu17",

@@ -71,3 +71,64 @@ void free_global_contexts()
 {
     SSL_CTX_free(clientCtx);
 }
+
+SSLConnection *SSLConnection_New(SSL *ssl)
+{
+    SSLConnection *conn = malloc(sizeof(SSLConnection));
+    memset(conn, 0, sizeof(SSLConnection));
+    conn->rawSsl = ssl;
+    conn->rawSocket = SSL_get_fd(ssl);
+    conn->readBuffer = BIO_new(BIO_s_mem());
+    conn->writeBuffer = BIO_new(BIO_s_mem());
+    return conn;
+}
+int SSLConnection_Accept(SSLConnection *conn)
+{
+    conn->lastRet = SSL_accept(conn->rawSsl);
+    if (conn->lastRet > 0 && !SSL_is_init_finished(conn->rawSsl))
+    {
+        // retry once
+        conn->lastRet = SSL_do_handshake(conn->rawSsl);
+    }
+    return conn->lastRet;
+}
+int SSLConnection_Connect(SSLConnection *conn)
+{
+    conn->lastRet = SSL_connect(conn->rawSsl);
+    if (conn->lastRet > 0 && !SSL_is_init_finished(conn->rawSsl))
+    {
+        // retry once
+        conn->lastRet = SSL_do_handshake(conn->rawSsl);
+    }
+    return conn->lastRet;
+}
+int SSLConnection_Read(SSLConnection *conn, void *buf, size_t num, size_t *readbytes)
+{
+    return conn->lastRet = SSL_read_ex(conn->rawSsl, buf, num, readbytes);
+}
+int SSLConnection_Write(SSLConnection *conn, const void *buf, size_t num, size_t *written)
+{
+    return conn->lastRet = SSL_write_ex(conn->rawSsl, buf, num, written);
+}
+int SSLConnection_GetLastError(const SSLConnection *conn)
+{
+    return SSL_get_error(conn->rawSsl, conn->lastRet);
+}
+int SSLConnection_Shutdown(SSLConnection *conn)
+{
+    int err = SSLConnection_GetLastError(conn);
+    if (err != SSL_ERROR_SSL && err != SSL_ERROR_SYSCALL)
+    {
+        return SSL_shutdown(conn->rawSsl);
+    }
+    return -1;
+}
+void SSLConnection_Free(SSLConnection *conn)
+{
+    if (conn->rawSsl)
+        SSL_free(conn->rawSsl);
+    if (conn->readBuffer)
+        BIO_free(conn->readBuffer);
+    if (conn->writeBuffer)
+        BIO_free(conn->writeBuffer);
+}

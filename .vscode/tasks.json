@@ -8,7 +8,7 @@
 			"args": [
 				"-fdiagnostics-color=always",
 				"-g",
-				"-DDEBUG",
+				"-D_DEBUG",
 				"${workspaceFolder}/src/*.c",
 				"-lssl",
 				"-lcrypto",

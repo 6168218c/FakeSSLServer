@@ -102,7 +102,7 @@ int main(int argc, char **argv)
         pthread_create(&thread, NULL, proxyHandler, ssl);
         pthread_detach(thread);
         // proxyHandler(ssl);
-        //  handleRequest(ssl);
+        //   handleRequest(ssl);
     }
 
     free_global_contexts();

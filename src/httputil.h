@@ -1,8 +1,8 @@
 #ifndef SUNK_HTTPUTIL_H
 #define SUNK_HTTPUTIL_H
 #include "shared.h"
+#include "sslutil.h"
 #include <stdbool.h>
-#include <openssl/ssl.h>
 #define BUF_SIZE 8192
 typedef void (*HeaderModifier)(BIO *target, const char *tagStart, const char *valueStart, int len);
 typedef enum __tagHttpStreamState
@@ -19,9 +19,8 @@ typedef enum __tagProxyResult
 } ProxyResult;
 typedef struct
 {
-    SSL *sslConnection;
+    SSLConnection *sslConnection;
     FILE *loggingFile;
-    int errCode;
     HttpStreamState streamState;
     BIO *header;
     BIO *contentCache;
